@@ -1,7 +1,6 @@
 // "data" edge function: schema introspection, CSV upload, validated SQL run.
 import { handleWithUsage, json, serviceClient } from "../_shared/usage.ts";
 
-const ALLOWED_SCHEMAS = new Set(["demo", "uploads"]);
 const BLOCKED_KEYWORDS =
   /\b(insert|update|delete|drop|alter|create|grant|revoke|truncate|copy|vacuum|analyze|call|do|set|reset|listen|notify|comment|lock|reindex|refresh|import|export)\b/i;
 
@@ -45,16 +44,18 @@ function inferType(values: unknown[]): string {
 
 Deno.serve(async (req: Request) => {
   return handleWithUsage(req, "data", async () => {
-    const { action } = await req.json();
+    // Parse the request body ONCE and reuse it for all actions.
+    const body: Record<string, unknown> = await req.json();
+    const action = String(body.action ?? "");
 
     if (action === "schema") {
       return await getSchema();
     }
     if (action === "upload") {
-      return await uploadCsv(await req.json());
+      return await uploadCsv(body);
     }
     if (action === "run") {
-      return await runSql(await req.json());
+      return await runSql(body);
     }
     return json({ error: `Unknown action: ${action}` }, 400);
   });
@@ -62,30 +63,28 @@ Deno.serve(async (req: Request) => {
 
 async function getSchema(): Promise<Response> {
   const supabase = serviceClient();
-  const { data, error } = await supabase.rpc("exec_sql", {
-    query: `
-      SELECT table_schema, table_name, column_name, data_type
-      FROM information_schema.columns
-      WHERE table_schema IN ('demo', 'uploads')
-      ORDER BY table_schema, table_name, ordinal_position
-    `,
-  });
+
+  // Use the safe get_schema_info RPC instead of the dropped open-ended exec_sql.
+  const { data, error } = await supabase.rpc("get_schema_info");
   if (error) return json({ error: error.message }, 500);
 
-  // Sample values: cheap approach - read a few rows per table via PostgREST.
+  const rows = (data as Record<string, string>[]) ?? [];
+
+  // Group columns by table
   const tables = new Map<string, SchemaTable>();
-  for (const row of data as Record<string, string>[]) {
+  for (const row of rows) {
     const key = `${row.table_schema}.${row.table_name}`;
     if (!tables.has(key)) tables.set(key, { table: key, columns: [] });
     tables.get(key)!.columns.push({ column: row.column_name, type: row.data_type, samples: [] });
   }
 
+  // Sample values: read a few rows per table via PostgREST.
   for (const [key, tbl] of tables) {
     const [schema, name] = key.split(".");
-    const { data: rows } = await supabase.schema(schema).from(name).select("*").limit(3);
-    if (rows && rows.length) {
+    const { data: sampleRows } = await supabase.schema(schema).from(name).select("*").limit(3);
+    if (sampleRows && sampleRows.length) {
       for (const col of tbl.columns) {
-        col.samples = rows
+        col.samples = sampleRows
           .slice(0, 3)
           .map((r: Record<string, unknown>) => r[col.column] ?? null);
       }
@@ -109,39 +108,34 @@ async function uploadCsv(body: Record<string, unknown>): Promise<Response> {
   const colNames = Object.keys(rows[0]);
   if (colNames.length === 0) return json({ error: "CSV has no columns" }, 400);
 
-  // Build typed DDL
-  const colDefs = colNames
-    .map((c) => {
-      const col = slugify(c) || "col";
-      const t = inferType(rows.map((r) => r[c]));
-      return `${JSON.stringify(col)} ${t}`;
-    })
-    .join(", ");
+  // Build column specs with whitelisted types for the safe create_upload_table RPC.
+  const columns = colNames.map((c) => ({
+    name: slugify(c) || "col",
+    type: inferType(rows.map((r) => r[c])),
+  }));
 
-  const ddl = `CREATE SCHEMA IF NOT EXISTS uploads;
-CREATE TABLE IF NOT EXISTS uploads.${JSON.stringify(tableName)} (${colDefs});`;
-
-  // Create the table via a helper function; we use exec_sql RPC if present,
-  // otherwise fall back to direct SQL via service role with the REST DDL endpoint.
-  const { error: ddlErr } = await supabase.rpc("exec_sql", { query: ddl });
+  const { error: ddlErr } = await supabase.rpc("create_upload_table", {
+    p_table: tableName,
+    p_columns: columns,
+  });
   if (ddlErr) return json({ error: `Failed to create table: ${ddlErr.message}` }, 500);
 
   // Insert rows in chunks
+  const slugCols = colNames.map(slugify);
   const chunkSize = 500;
   for (let i = 0; i < rows.length; i += chunkSize) {
     const chunk = rows.slice(i, i + chunkSize).map((r) => {
       const out: Record<string, unknown> = {};
-      for (const c of colNames) {
-        out[slugify(c)] =
-          r[c] === "" || r[c] === undefined ? null : r[c];
-      }
+      slugCols.forEach((sc, ci) => {
+        out[sc] = r[colNames[ci]] === "" || r[colNames[ci]] === undefined ? null : r[colNames[ci]];
+      });
       return out;
     });
     const { error: insErr } = await supabase.schema("uploads").from(tableName).insert(chunk);
     if (insErr) return json({ error: `Failed to insert rows: ${insErr.message}` }, 500);
   }
 
-  return json({ table: `uploads.${tableName}`, rows: rows.length, columns: colNames.map(slugify) });
+  return json({ table: `uploads.${tableName}`, rows: rows.length, columns: slugCols });
 }
 
 async function runSql(body: Record<string, unknown>): Promise<Response> {
@@ -162,7 +156,7 @@ async function runSql(body: Record<string, unknown>): Promise<Response> {
   if (BLOCKED_KEYWORDS.test(sql))
     return json({ error: "Write and DDL statements are not allowed" }, 400);
 
-  // Add LIMIT 1000 if none present (simple heuristic: top-level limit)
+  // Add LIMIT 1000 if none present
   let finalSql = sql;
   if (!/\blimit\s+\d+/i.test(sql)) {
     finalSql = `${sql}\nLIMIT 1000`;

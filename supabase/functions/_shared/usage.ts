@@ -28,29 +28,22 @@ export function serviceClient() {
 
 const DEFAULT_DAILY_CALL_LIMIT = 200;
 
-// Increment today's counter for the function; return { ok, calls }.
-// ok=false means the daily demo limit is reached and the caller should 429.
+// Atomically increment today's counter via a SECURITY DEFINER function and
+// check against the limit. Returns { ok, calls }. On error, fail closed
+// (ok=false) so the caller returns 503 instead of proceeding.
 export async function checkAndIncrementUsage(fn: string): Promise<{ ok: boolean; calls: number }> {
   const supabase = serviceClient();
   const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? "", 10) || DEFAULT_DAILY_CALL_LIMIT;
-  const today = new Date().toISOString().slice(0, 10);
 
-  const { data, error } = await supabase
-    .from("usage_counters")
-    .select("calls")
-    .eq("day", today)
-    .eq("fn", fn)
-    .maybeSingle();
+  const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: fn });
 
-  const current = error ? 0 : (data?.calls ?? 0);
-  if (current >= limit) return { ok: false, calls: current };
+  if (error) {
+    // Fail closed: deny the request rather than allowing it through.
+    return { ok: false, calls: 0 };
+  }
 
-  const { error: upErr } = await supabase
-    .from("usage_counters")
-    .upsert({ day: today, fn, calls: current + 1 }, { onConflict: "day,fn" });
-
-  if (upErr) return { ok: true, calls: current + 1 }; // fail open for demo
-  return { ok: true, calls: current + 1 };
+  const calls = (data as number) ?? 0;
+  return { ok: calls <= limit, calls };
 }
 
 export async function handleWithUsage(
@@ -62,7 +55,13 @@ export async function handleWithUsage(
   if (pf) return pf;
   try {
     const usage = await checkAndIncrementUsage(fn);
-    if (!usage.ok) return json({ error: "Daily demo limit reached" }, 429);
+    if (!usage.ok) {
+      // Distinguish "over limit" (429) from "counter error" (503 fail-closed)
+      return json(
+        { error: usage.calls > 0 ? "Daily demo limit reached" : "Usage counter unavailable" },
+        usage.calls > 0 ? 429 : 503,
+      );
+    }
     return await work();
   } catch (err) {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
