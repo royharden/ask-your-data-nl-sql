@@ -1,0 +1,10 @@
+project_id = "ask-your-data"
+
+[functions.data]
+verify_jwt = false
+
+[functions.jev-route]
+verify_jwt = false
+
+[functions.llm]
+verify_jwt = false
