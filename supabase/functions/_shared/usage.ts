@@ -1,69 +1,77 @@
-// Shared helpers for edge functions: CORS, service-role client, usage limits.
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
-
-export const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
-};
-
-export function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
-}
-
-export function preflight(req: Request): Response | null {
-  if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
-  return null;
-}
-
-export function serviceClient() {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) throw new Error("Supabase credentials are not configured");
-  return createClient(url, key, { auth: { persistSession: false } });
-}
+// Daily cap on paid upstream calls (TypeSafe/Jev, OpenAI), counted per fetch.
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
+import { DailyLimitError, UpstreamError, UsageUnavailableError } from "./http.ts";
 
 const DEFAULT_DAILY_CALL_LIMIT = 200;
+const MAX_ATTEMPTS = 2;
+const DEFAULT_TIMEOUT_MS = 30_000;
 
-// Atomically increment today's counter via a SECURITY DEFINER function and
-// check against the limit. Returns { ok, calls }. On error, fail closed
-// (ok=false) so the caller returns 503 instead of proceeding.
-export async function checkAndIncrementUsage(fn: string): Promise<{ ok: boolean; calls: number }> {
-  const supabase = serviceClient();
-  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? "", 10) || DEFAULT_DAILY_CALL_LIMIT;
-
-  const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: fn });
-
-  if (error) {
-    // Fail closed: deny the request rather than allowing it through.
-    return { ok: false, calls: 0 };
-  }
-
-  const calls = (data as number) ?? 0;
-  return { ok: calls <= limit, calls };
+function dailyLimit(): number {
+  const raw = (Deno.env.get("DAILY_CALL_LIMIT") ?? "").trim();
+  return /^\d+$/.test(raw) ? Number(raw) : DEFAULT_DAILY_CALL_LIMIT;
 }
 
-export async function handleWithUsage(
-  req: Request,
-  fn: string,
-  work: () => Promise<Response>,
-): Promise<Response> {
-  const pf = preflight(req);
-  if (pf) return pf;
+// Atomically count one call for `fn` today via the SECURITY DEFINER
+// increment_usage_counter RPC. Fails closed: an RPC error or a null /
+// non-integer result throws UsageUnavailableError (503), and a count over the
+// cap throws DailyLimitError (429).
+export async function countCall(db: SupabaseClient, fn: string): Promise<number> {
+  let data: unknown = null;
+  let error: unknown = null;
   try {
-    const usage = await checkAndIncrementUsage(fn);
-    if (!usage.ok) {
-      // Distinguish "over limit" (429) from "counter error" (503 fail-closed)
-      return json(
-        { error: usage.calls > 0 ? "Daily demo limit reached" : "Usage counter unavailable" },
-        usage.calls > 0 ? 429 : 503,
-      );
-    }
-    return await work();
+    ({ data, error } = await db.rpc("increment_usage_counter", { p_fn: fn }));
   } catch (err) {
-    return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+    error = err;
+  }
+  if (error) {
+    console.error(`[usage] counter RPC failed for ${fn}`, error);
+    throw new UsageUnavailableError();
+  }
+  if (typeof data !== "number" || !Number.isInteger(data) || data < 1) {
+    console.error(`[usage] counter returned a non-integer for ${fn}`, data);
+    throw new UsageUnavailableError();
+  }
+  if (data > dailyLimit()) throw new DailyLimitError();
+  return data;
+}
+
+function backoff(attempt: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, 2 ** attempt * 250));
+}
+
+export interface PaidService {
+  counter: string; // usage_counters.fn key
+  name: string; // shown to the client on failure
+}
+
+// fetch() for paid upstream APIs. Every attempt is counted right before it is
+// sent; a daily limit is never retried. Retries only on 429/529 or a network
+// error (including timeout), at most MAX_ATTEMPTS in total.
+export async function paidFetch(
+  db: SupabaseClient,
+  service: PaidService,
+  url: string,
+  init: RequestInit,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    await countCall(db, service.counter);
+    let res: Response;
+    try {
+      res = await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    } catch (err) {
+      if (attempt < MAX_ATTEMPTS) {
+        await backoff(attempt);
+        continue;
+      }
+      console.error(`[${service.counter}] ${service.name} network error`, err);
+      throw new UpstreamError(service.name, 0);
+    }
+    if ((res.status === 429 || res.status === 529) && attempt < MAX_ATTEMPTS) {
+      await res.body?.cancel().catch(() => {});
+      await backoff(attempt);
+      continue;
+    }
+    return res;
   }
 }

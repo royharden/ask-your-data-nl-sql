@@ -1,5 +1,5 @@
 import type { JevAnswers } from "@/lib/types";
-import type { ColRef, RouteResult } from "@/lib/routing";
+import type { RouteResult } from "@/lib/routing";
 import { Activity, CheckCircle2, XCircle, Circle } from "lucide-react";
 
 interface Props {

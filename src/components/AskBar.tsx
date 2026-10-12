@@ -22,6 +22,7 @@ export function AskBar({ onAsk, presetQuestions, busy }: Props) {
         <input
           value={value}
           onChange={(e) => setValue(e.target.value)}
+          maxLength={400}
           placeholder="Ask a question about your data..."
           className="flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 outline-none focus:border-cyan-700"
         />

@@ -9,7 +9,7 @@ import {
   Upload,
 } from "lucide-react";
 import type { ColRef } from "@/lib/routing";
-import { supabase } from "@/lib/supabase";
+import { invokeFn } from "@/lib/supabase";
 import type { SchemaTable } from "@/lib/types";
 
 interface Props {
@@ -44,10 +44,14 @@ export function DataPanel({ schema, selectedCols, onSchemaChanged }: Props) {
       const rows = parsed.data;
       if (!rows.length) throw new Error("No data rows found");
       if (rows.length > 50000) throw new Error("File exceeds the 50,000 row limit.");
-      await supabase.functions.invoke("data", {
-        body: { action: "upload", name: file.name, rows },
+      if ((parsed.meta.fields?.length ?? 0) > 100) throw new Error("File exceeds the 100 column limit.");
+      // The data function re-parses and validates the CSV server-side.
+      const res = await invokeFn<{ rows: number }>("data", {
+        action: "upload",
+        name: file.name,
+        csv: text,
       });
-      setUploadMsg(`Uploaded ${rows.length} rows as a new table.`);
+      setUploadMsg(`Uploaded ${res.rows ?? rows.length} rows as a new table.`);
       onSchemaChanged();
     } catch (err) {
       setUploadMsg(err instanceof Error ? err.message : "Upload failed");

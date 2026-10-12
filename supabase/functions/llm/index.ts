@@ -1,47 +1,48 @@
 // "llm" edge function: write SQL, explain results, describe missing data.
 // Falls back to templated mock output when OPENAI_API_KEY is missing or
-// mock mode is on (Jev still runs live in that case).
-import { handleWithUsage, json } from "../_shared/usage.ts";
+// mock mode is on (Jev still runs live in that case). Every OpenAI request is
+// counted against the daily cap right before it is sent.
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
+import { HttpError, json, readJsonBody, serve, UpstreamError } from "../_shared/http.ts";
+import { parseQuestion, parseSchema, type SchemaTable } from "../_shared/schema.ts";
+import { paidFetch } from "../_shared/usage.ts";
 
 interface ChartSpec {
   type: "bar" | "line" | "pie" | "table";
   x?: string;
   y?: string | string[];
 }
-interface SchemaCol {
-  column: string;
-  type: string;
-  samples?: unknown[];
-}
-interface SchemaTable {
-  table: string;
-  columns: SchemaCol[];
-}
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_MODEL = "gpt-4o-mini";
+const OPENAI = { counter: "llm", name: "LLM" };
+const MAX_BODY_BYTES = 512 * 1024;
+const MAX_SQL_CHARS = 10_000;
+const MAX_ROWS = 50;
+const MAX_ROW_KEYS = 100;
+const MAX_CELL_CHARS = 200;
+const MAX_ROWS_JSON_CHARS = 20_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-Deno.serve(async (req: Request) => {
-  return handleWithUsage(req, "llm", async () => {
-    const body = await req.json();
-    const action = body.action;
-    const mock = Boolean(body.mock);
+serve("llm", async (req, db) => {
+  const { body } = await readJsonBody(req, MAX_BODY_BYTES);
+  const action = body.action;
+  const mock = Boolean(body.mock);
 
-    if (action === "write_sql") {
-      return json(await writeSql(body, mock));
-    }
-    if (action === "explain") {
-      return json(await explain(body, mock));
-    }
-    if (action === "missing") {
-      return json(await missing(body, mock));
-    }
-    return json({ error: `Unknown action: ${action}` }, 400);
-  });
+  if (action === "write_sql") {
+    return json(await writeSql(db, body, mock));
+  }
+  if (action === "explain") {
+    return json(await explain(db, body, mock));
+  }
+  if (action === "missing") {
+    return json(await missing(db, body, mock));
+  }
+  throw new HttpError(400, "Unknown action");
 });
 
 function getBaseUrl(): string {
-  return Deno.env.get("OPENAI_BASE_URL") || DEFAULT_BASE_URL;
+  return (Deno.env.get("OPENAI_BASE_URL") || DEFAULT_BASE_URL).replace(/\/+$/, "");
 }
 function getModel(): string {
   return Deno.env.get("OPENAI_MODEL") || DEFAULT_MODEL;
@@ -51,9 +52,10 @@ function hasKey(): boolean {
 }
 
 async function chat(
+  db: SupabaseClient,
   messages: { role: string; content: string }[],
 ): Promise<string | null> {
-  const res = await fetch(`${getBaseUrl()}/chat/completions`, {
+  const res = await paidFetch(db, OPENAI, `${getBaseUrl()}/chat/completions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}`,
@@ -67,17 +69,71 @@ async function chat(
     }),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI error ${res.status}: ${text.slice(0, 300)}`);
+    const text = await res.text().catch(() => "");
+    console.error(`[llm] OpenAI returned ${res.status}: ${text.slice(0, 500)}`);
+    throw new UpstreamError(OPENAI.name, res.status);
   }
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? null;
+  let data: { choices?: { message?: { content?: unknown } }[] };
+  try {
+    data = await res.json();
+  } catch (err) {
+    console.error("[llm] OpenAI returned invalid JSON", err);
+    throw new UpstreamError(OPENAI.name, res.status);
+  }
+  const content = data.choices?.[0]?.message?.content;
+  return typeof content === "string" ? content : null;
 }
 
 function schemaText(tables: SchemaTable[]): string {
   return tables
     .map((t) => `${t.table}(${t.columns.map((c) => `${c.column} ${c.type}`).join(", ")})`)
     .join("\n");
+}
+
+function parseSql(value: unknown): string {
+  const sql = typeof value === "string" ? value : "";
+  if (sql.length > MAX_SQL_CHARS) throw new HttpError(422, `SQL is limited to ${MAX_SQL_CHARS} characters`);
+  return sql;
+}
+
+function parseRows(value: unknown): Record<string, unknown>[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_ROWS) {
+    throw new HttpError(422, `rows is limited to ${MAX_ROWS} items`);
+  }
+  for (const r of value) {
+    if (!r || typeof r !== "object" || Array.isArray(r) || Object.keys(r).length > MAX_ROW_KEYS) {
+      throw new HttpError(422, "Invalid result row");
+    }
+  }
+  return value as Record<string, unknown>[];
+}
+
+// Result rows as prompt text: long cells clipped, total size capped.
+function promptRows(rows: Record<string, unknown>[]): string {
+  const clipped = rows.map((r) =>
+    Object.fromEntries(
+      Object.entries(r).map(([k, v]) => [
+        k,
+        typeof v === "string" && v.length > MAX_CELL_CHARS ? `${v.slice(0, MAX_CELL_CHARS)}…` : v,
+      ]),
+    ),
+  );
+  return JSON.stringify(clipped).slice(0, MAX_ROWS_JSON_CHARS);
+}
+
+// Store the explanation on the queries row the data function created for this
+// run. Only fills an empty explanation on a recent row.
+async function recordExplanation(db: SupabaseClient, queryId: unknown, explanation: string) {
+  if (typeof queryId !== "string" || !UUID_RE.test(queryId)) return;
+  const since = new Date(Date.now() - 15 * 60_000).toISOString();
+  const { error } = await db
+    .from("queries")
+    .update({ explanation })
+    .eq("id", queryId)
+    .is("explanation", null)
+    .gte("created_at", since);
+  if (error) console.error("[llm] could not record explanation", error);
 }
 
 // ---------- mock fallbacks ----------
@@ -125,11 +181,12 @@ function mockExplain(question: string, rows: Record<string, unknown>[]): string 
 // ---------- actions ----------
 
 async function writeSql(
+  db: SupabaseClient,
   body: Record<string, unknown>,
   mock: boolean,
 ): Promise<unknown> {
-  const question = String(body.question ?? "");
-  const tables = (body.schema ?? []) as SchemaTable[];
+  const question = parseQuestion(body.question);
+  const tables = parseSchema(body.schema ?? []);
   if (!tables.length) return { error: "schema is required" };
 
   if (mock || !hasKey()) {
@@ -151,7 +208,7 @@ User question: ${question}
 
 Return JSON: {"sql": "...", "chart": {"type": "bar", "x": "...", "y": "..."}, "assumptions": ["..."]}`;
 
-  const content = await chat([
+  const content = await chat(db, [
     { role: "system", content: "You write safe, correct PostgreSQL for analytics." },
     { role: "user", content: prompt },
   ]);
@@ -167,20 +224,24 @@ Return JSON: {"sql": "...", "chart": {"type": "bar", "x": "...", "y": "..."}, "a
       model: getModel(),
     };
   } catch {
-    return { error: "Could not parse LLM JSON output", raw: content.slice(0, 500) };
+    console.error("[llm] could not parse write_sql output", content.slice(0, 500));
+    return { error: "Could not parse LLM JSON output" };
   }
 }
 
 async function explain(
+  db: SupabaseClient,
   body: Record<string, unknown>,
   mock: boolean,
 ): Promise<unknown> {
-  const question = String(body.question ?? "");
-  const sql = String(body.sql ?? "");
-  const rows = (body.rows ?? []) as Record<string, unknown>[];
+  const question = parseQuestion(body.question);
+  const sql = parseSql(body.sql);
+  const rows = parseRows(body.rows);
 
   if (mock || !hasKey()) {
-    return { explanation: mockExplain(question, rows), mocked: true, model: "mock" };
+    const explanation = mockExplain(question, rows);
+    await recordExplanation(db, body.query_id, explanation);
+    return { explanation, mocked: true, model: "mock" };
   }
 
   const prompt = `User question: ${question}
@@ -189,32 +250,32 @@ SQL that was run:
 ${sql}
 
 First rows of the result (JSON):
-${JSON.stringify(rows.slice(0, 50))}
+${promptRows(rows)}
 
 Write a 2-3 sentence plain-English answer to the question. Name actual numbers from the rows. Return JSON: {"explanation": "..."}`;
 
-  const content = await chat([
+  const content = await chat(db, [
     { role: "system", content: "You explain data results clearly and concisely." },
     { role: "user", content: prompt },
   ]);
   if (!content) return { error: "Empty response from LLM" };
+  let explanation: string;
   try {
-    return {
-      explanation: String(JSON.parse(content).explanation ?? ""),
-      mocked: false,
-      model: getModel(),
-    };
+    explanation = String(JSON.parse(content).explanation ?? "");
   } catch {
-    return { explanation: content.slice(0, 400), mocked: false, model: getModel() };
+    explanation = content.slice(0, 400);
   }
+  await recordExplanation(db, body.query_id, explanation);
+  return { explanation, mocked: false, model: getModel() };
 }
 
 async function missing(
+  db: SupabaseClient,
   body: Record<string, unknown>,
   mock: boolean,
 ): Promise<unknown> {
-  const question = String(body.question ?? "");
-  const tables = (body.schema ?? []) as SchemaTable[];
+  const question = parseQuestion(body.question);
+  const tables = parseSchema(body.schema ?? []);
 
   if (mock || !hasKey()) {
     return {
@@ -231,7 +292,7 @@ ${schemaText(tables)}
 
 In ONE sentence, state which data seems to be missing that would be needed to answer the question. Return JSON: {"missing": "..."}`;
 
-  const content = await chat([
+  const content = await chat(db, [
     { role: "system", content: "You identify missing data precisely and briefly." },
     { role: "user", content: prompt },
   ]);

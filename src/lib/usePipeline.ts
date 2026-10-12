@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { invokeFn, supabase } from "./supabase";
+import { invokeFn } from "./supabase";
 import { route, type ColRef } from "./routing";
 import type {
   ChartSpec,
@@ -59,6 +59,7 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
   const [busy, setBusy] = useState(false);
   const [clarifyTable, setClarifyTable] = useState<Record<string, number> | null>(null);
   const [ambiguous, setAmbiguous] = useState(false);
+  const [lastQuestion, setLastQuestion] = useState("");
 
   const loadSchema = useCallback(async () => {
     try {
@@ -100,17 +101,11 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
       ];
       setSteps(stepDefs.map((s) => ({ ...s, status: "pending" })));
 
+      setLastQuestion(question);
+
       let questionId: string | null = null;
       try {
-        // persist question
-        const { data: q } = await supabase
-          .from("questions")
-          .insert({ text: question, dataset: "demo", mode: mockMode ? "mock" : "live" })
-          .select("id")
-          .single();
-        questionId = q?.id ?? null;
-
-        // 1. Jev routing
+        // 1. Jev routing (jev-route records the question and routing rows)
         setStep("jev", { status: "active" });
         const jev = await invokeFn<{
           answers: JevAnswers;
@@ -119,10 +114,16 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
           input_tokens: number;
           cost_usd: number;
           error?: string;
-          table?: { probabilities?: Record<string, number> };
-        }>("jev-route", { user_question: question, schema });
+          question_id?: string | null;
+        }>("jev-route", {
+          user_question: question,
+          schema,
+          mode: mockMode ? "mock" : "live",
+          policy,
+        });
 
         if (jev.error) throw new Error(jev.error);
+        questionId = jev.question_id ?? null;
 
         setJevAnswers(jev.answers);
         setJevStats({
@@ -148,23 +149,6 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
           raw: rr.schemaSlice,
         });
 
-        // record routing
-        if (questionId) {
-          await supabase.from("routing").insert({
-            question_id: questionId,
-            jev_request: { user_question: question, schema },
-            jev_response: jev,
-            model: jev.model,
-            latency_ms: jev.latency_ms,
-            input_tokens: jev.input_tokens,
-            cost_usd: jev.cost_usd,
-            decision: rr.decision,
-            fired_rules: rr.firedRules,
-            schema_slice: rr.schemaSlice,
-            policy,
-          });
-        }
-
         if (rr.decision === "refuse_unanswerable") {
           setStep("sql", { status: "error", meta: "refused" });
           setStep("valid", { status: "error", meta: "refused" });
@@ -189,7 +173,11 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
         }
 
         if (rr.decision === "clarify_table") {
-          setClarifyTable(jev.table?.probabilities ?? {});
+          setClarifyTable(
+            Object.fromEntries(
+              Object.entries(jev.answers?.table?.probabilities ?? {}).filter(([t]) => t !== "uncertain"),
+            ),
+          );
           setStep("sql", { status: "error", meta: "needs table pick" });
           setStep("valid", { status: "error", meta: "waiting" });
           setStep("exec", { status: "error", meta: "waiting" });
@@ -220,9 +208,11 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
         // 4+5. Validate & execute via the data function (validator runs there)
         setStep("valid", { status: "active" });
         setStep("exec", { status: "active" });
-        const run = await invokeFn<SqlResult & { error?: string }>("data", {
+        const run = await invokeFn<SqlResult & { error?: string; query_id?: string | null }>("data", {
           action: "run",
           sql: gen.sql,
+          question_id: questionId,
+          chart: gen.chart ?? { type: "bar" },
         });
         if (run.error) {
           setStep("valid", { status: "error", meta: "invalid" });
@@ -245,20 +235,10 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
           sql: run.sql,
           rows: run.rows.slice(0, 50),
           mock: mockMode,
+          query_id: run.query_id ?? null,
         });
         setExplanation(exp.explanation);
         setStep("explain", { status: "done", meta: "done", raw: exp });
-
-        await supabase.from("queries").insert({
-          question_id: questionId,
-          sql: run.sql,
-          chart: gen.chart ?? { type: "bar" },
-          valid: true,
-          row_count: run.row_count,
-          exec_ms: run.exec_ms,
-          explanation: exp.explanation,
-          edited_by_user: false,
-        });
 
         setHistory((h) =>
           [
@@ -334,6 +314,7 @@ export function usePipeline(policy: Policy, mockMode: boolean) {
     busy,
     clarifyTable,
     ambiguous,
+    lastQuestion,
     ask,
     runEditedSql,
     rerun,

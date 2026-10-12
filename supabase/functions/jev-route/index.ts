@@ -1,21 +1,20 @@
 // "jev-route" edge function: one fan-out request to TypeSafe System One.
 // Jev checks answerability, picks the table, selects relevant columns.
-import { handleWithUsage, json } from "../_shared/usage.ts";
+// Without TYPESAFE_API_KEY it falls back to a keyword-based mock router so the
+// demo keeps working. The question and routing rows are recorded here with the
+// service-role client (clients can no longer write those tables).
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
+import { HttpError, json, readJsonBody, serve, UpstreamError } from "../_shared/http.ts";
+import { route, type JevAnswers, type Policy } from "../_shared/routing.ts";
+import { parseQuestion, parseSchema, type SchemaTable } from "../_shared/schema.ts";
+import { paidFetch } from "../_shared/usage.ts";
 
 const MODEL = "jev-1.13.0";
+const TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
+const TYPESAFE = { counter: "jev-route", name: "Jev routing" };
 const INPUT_COST_PER_MILLION = 0.042; // USD; output tokens are free
 const MAX_COLUMNS = 40;
-const MAX_RETRIES = 3;
-
-interface SchemaCol {
-  column: string;
-  type: string;
-  samples?: unknown[];
-}
-export interface SchemaTable {
-  table: string; // qualified name like demo.orders
-  columns: SchemaCol[];
-}
+const MAX_BODY_BYTES = 512 * 1024;
 
 interface Question {
   id: string;
@@ -25,10 +24,21 @@ interface Question {
 }
 
 interface TypeSafeAnswer {
+  id?: string;
   choice?: string;
   noul?: number;
   confidence?: number;
   probabilities?: Record<string, number>;
+}
+
+interface RouteResponse {
+  answers: Record<string, TypeSafeAnswer>;
+  model: string;
+  usage: Record<string, number>;
+  latency_ms: number;
+  input_tokens: number;
+  cost_usd: number;
+  mocked?: boolean;
 }
 
 const TRUE_CRITERIA =
@@ -36,16 +46,78 @@ const TRUE_CRITERIA =
 const FALSE_CRITERIA =
   "The question needs data that is not in `schema`, or it is not a data question.";
 
-Deno.serve(async (req: Request) => {
-  return handleWithUsage(req, "jev-route", async () => {
-    const { user_question, schema } = await req.json();
-    if (!user_question || !Array.isArray(schema))
-      return json({ error: "user_question and schema are required" }, 400);
+serve("jev-route", async (req, db) => {
+  const { body } = await readJsonBody(req, MAX_BODY_BYTES);
+  const question = parseQuestion(body.user_question);
+  const schema = parseSchema(body.schema);
+  const mode = body.mode === "mock" ? "mock" : "live";
+  const policy = body.policy === undefined ? null : parsePolicy(body.policy);
 
-    const result = await route(user_question, schema as SchemaTable[]);
-    return json(result);
-  });
+  const questionId = await recordQuestion(db, question, mode);
+  const result = Deno.env.get("TYPESAFE_API_KEY")
+    ? await routeWithJev(db, question, schema)
+    : mockRoute(question, schema);
+  await recordRouting(db, questionId, question, schema, result, policy);
+
+  return json({ ...result, question_id: questionId });
 });
+
+function parsePolicy(value: unknown): Policy {
+  const p = value as Record<string, unknown> | null;
+  if (!p || typeof p !== "object") throw new HttpError(422, "Invalid policy");
+  const out = {} as Policy;
+  for (const key of ["answerableMin", "tableMinConfidence", "ambiguityAsk", "colKeep"] as const) {
+    const v = p[key];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new HttpError(422, "Invalid policy");
+    }
+    out[key] = v;
+  }
+  return out;
+}
+
+async function recordQuestion(
+  db: SupabaseClient,
+  text: string,
+  mode: "live" | "mock",
+): Promise<string | null> {
+  const { data, error } = await db
+    .from("questions")
+    .insert({ text, dataset: "demo", mode })
+    .select("id")
+    .single();
+  if (error) {
+    console.error("[jev-route] could not record question", error);
+    return null;
+  }
+  return (data as { id?: string } | null)?.id ?? null;
+}
+
+async function recordRouting(
+  db: SupabaseClient,
+  questionId: string | null,
+  question: string,
+  schema: SchemaTable[],
+  result: RouteResponse,
+  policy: Policy | null,
+): Promise<void> {
+  if (!questionId) return;
+  const rr = policy ? route(result.answers as JevAnswers, policy, schema) : null;
+  const { error } = await db.from("routing").insert({
+    question_id: questionId,
+    jev_request: { user_question: question, schema },
+    jev_response: result,
+    model: result.model,
+    latency_ms: result.latency_ms,
+    input_tokens: result.input_tokens,
+    cost_usd: result.cost_usd,
+    decision: rr?.decision ?? null,
+    fired_rules: rr?.firedRules ?? null,
+    schema_slice: rr?.schemaSlice ?? null,
+    policy,
+  });
+  if (error) console.error("[jev-route] could not record routing", error);
+}
 
 function buildQuestions(tables: SchemaTable[]): Question[] {
   const tableNames = tables.map((t) => t.table);
@@ -104,72 +176,54 @@ function buildColumnQuestions(
   return qs;
 }
 
+// One TypeSafe request. paidFetch counts every attempt (and retry) against the
+// daily cap before sending it; failures are logged here, never returned.
 async function callTypeSafe(
+  db: SupabaseClient,
   questions: Question[],
   state: Record<string, unknown>,
 ): Promise<{ answers: Record<string, TypeSafeAnswer>; usage: Record<string, number>; model: string }> {
-  const apiKey = Deno.env.get("TYPESAFE_API_KEY");
-  if (!apiKey) throw new Error("TYPESAFE_API_KEY is not configured");
-
-  const body = JSON.stringify({
-    model: MODEL,
-    questions,
-    state,
+  const res = await paidFetch(db, TYPESAFE, TYPESAFE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${Deno.env.get("TYPESAFE_API_KEY")}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model: MODEL, questions, state }),
   });
 
-  let lastErr: unknown = null;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const started = performance.now();
-    try {
-      const res = await fetch("https://api.typesafe.ai/v1/systemone", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body,
-      });
-
-      if (res.status === 429 || res.status === 529) {
-        lastErr = new Error(`TypeSafe returned ${res.status}`);
-        if (attempt < MAX_RETRIES) {
-          await new Promise((r) => setTimeout(r, 2 ** attempt * 250));
-          continue;
-        }
-        throw lastErr;
-      }
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`TypeSafe error ${res.status}: ${text.slice(0, 200)}`);
-      }
-
-      const data = await res.json();
-      console.log("TypeSafe response.model:", data.model);
-
-      const answers: Record<string, TypeSafeAnswer> = {};
-      for (const a of data.answers ?? []) {
-        answers[a.id] = a;
-      }
-
-      return {
-        answers,
-        usage: data.usage ?? {},
-        model: data.model ?? MODEL,
-      };
-    } catch (err) {
-      lastErr = err;
-      if (attempt < MAX_RETRIES) {
-        await new Promise((r) => setTimeout(r, 2 ** attempt * 250));
-        continue;
-      }
-      throw err;
-    }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error(`[jev-route] TypeSafe returned ${res.status}: ${text.slice(0, 500)}`);
+    throw new UpstreamError(TYPESAFE.name, res.status);
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+
+  let data: { answers?: unknown; usage?: Record<string, number>; model?: string };
+  try {
+    data = await res.json();
+  } catch (err) {
+    console.error("[jev-route] TypeSafe returned invalid JSON", err);
+    throw new UpstreamError(TYPESAFE.name, res.status);
+  }
+  console.log("TypeSafe response.model:", data.model);
+
+  const answers: Record<string, TypeSafeAnswer> = {};
+  for (const a of Array.isArray(data.answers) ? data.answers : []) {
+    if (a && typeof a.id === "string") answers[a.id] = a;
+  }
+
+  return {
+    answers,
+    usage: data.usage ?? {},
+    model: data.model ?? MODEL,
+  };
 }
 
-async function route(userQuestion: string, schema: SchemaTable[]) {
+async function routeWithJev(
+  db: SupabaseClient,
+  userQuestion: string,
+  schema: SchemaTable[],
+): Promise<RouteResponse> {
   const started = performance.now();
 
   const state = {
@@ -192,36 +246,25 @@ async function route(userQuestion: string, schema: SchemaTable[]) {
   let answers: Record<string, TypeSafeAnswer> = {};
   let usage: Record<string, number> = {};
 
+  // One request with everything; fall back to split on size rejection. Each
+  // split request is counted separately.
   try {
-    // One request with everything; fall back to split on size rejection.
-    const all = [...routingQs, ...colQs];
-    try {
-      const r = await callTypeSafe(all, state);
-      answers = r.answers;
-      usage = r.usage;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/size|too large|413/i.test(msg)) {
-        const r1 = await callTypeSafe(routingQs, state);
-        const r2 = await callTypeSafe(colQs, state);
-        answers = { ...r1.answers, ...r2.answers };
-        usage = {
-          input_tokens: (r1.usage.input_tokens ?? 0) + (r2.usage.input_tokens ?? 0),
-        };
-      } else {
-        throw err;
-      }
-    }
+    const r = await callTypeSafe(db, [...routingQs, ...colQs], state);
+    answers = r.answers;
+    usage = r.usage;
   } catch (err) {
-    return {
-      error: err instanceof Error ? err.message : String(err),
-      latency_ms: Math.round(performance.now() - started),
+    if (!(err instanceof UpstreamError && err.status === 413) || colQs.length === 0) throw err;
+    const r1 = await callTypeSafe(db, routingQs, state);
+    const r2 = await callTypeSafe(db, colQs, state);
+    answers = { ...r1.answers, ...r2.answers };
+    usage = {
+      input_tokens: (Number(r1.usage.input_tokens) || 0) + (Number(r2.usage.input_tokens) || 0),
     };
   }
 
   const latencyMs = Math.round(performance.now() - started);
-  const inputTokens = usage.input_tokens ?? 0;
-  const costUsd = (inputTokens * 0.042) / 1_000_000;
+  const inputTokens = Number(usage.input_tokens) || 0;
+  const costUsd = (inputTokens * INPUT_COST_PER_MILLION) / 1_000_000;
 
   return {
     answers,
@@ -230,5 +273,106 @@ async function route(userQuestion: string, schema: SchemaTable[]) {
     latency_ms: latencyMs,
     input_tokens: inputTokens,
     cost_usd: Number(costUsd.toFixed(8)),
+  };
+}
+
+// ---------- mock router (no TYPESAFE_API_KEY) ----------
+
+const STOP_PARTS = new Set(["id", "at", "on", "of", "the", "and", "usd"]);
+const REVENUE_WORDS = new Set(["revenue", "sale", "sold", "spend", "spent", "money", "earn", "earned"]);
+const TIME_WORDS = new Set([
+  "trend", "month", "monthly", "week", "weekly", "day", "daily", "year", "yearly", "quarter", "date", "when", "time",
+]);
+const AMBIGUOUS_WORDS = new Set([
+  "best", "worst", "top", "good", "bad", "popular", "performing", "busiest", "important", "interesting",
+]);
+const METRIC_WORDS = new Set([
+  "revenue", "sale", "count", "number", "average", "avg", "total", "sum", "quantity", "price", "many", "much",
+  "most", "highest", "lowest", "size",
+]);
+
+function stem(w: string): string {
+  if (w.length > 4 && w.endsWith("ies")) return `${w.slice(0, -3)}y`;
+  if (w.length > 3 && w.endsWith("s") && !w.endsWith("ss")) return w.slice(0, -1);
+  return w;
+}
+
+function words(s: string): string[] {
+  return (s.toLowerCase().match(/[a-z][a-z0-9]*/g) ?? []).map(stem);
+}
+
+function nameParts(name: string): string[] {
+  return name
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((p) => p.length >= 3 && !STOP_PARTS.has(p))
+    .map(stem);
+}
+
+// Keyword heuristics shaped like a TypeSafe response so the routing policy,
+// Jev panel and the rest of the pipeline work without a TypeSafe key.
+function mockRoute(question: string, schema: SchemaTable[]): RouteResponse {
+  const started = performance.now();
+  const q = new Set(words(question));
+  const revenueAsked = [...q].some((w) => REVENUE_WORDS.has(w));
+  const timeAsked = [...q].some((w) => TIME_WORDS.has(w) || /^q[1-4]$/.test(w));
+
+  // Table name hit 3, column name hit 1, revenue/time synonym hit 0.5. Key
+  // columns are not matched by name (route() always keeps them).
+  const scores = new Map<string, number>();
+  const hitCols = new Set<string>();
+  for (const t of schema) {
+    let score = nameParts(t.table.split(".")[1] ?? t.table).some((p) => q.has(p)) ? 3 : 0;
+    for (const c of t.columns) {
+      const isKey = /(^|_)id$/i.test(c.column);
+      const nameHit = !isKey && nameParts(c.column).some((p) => q.has(p));
+      const synonymHit =
+        (revenueAsked && /price|amount|revenue|total|quantity|sales|cost/i.test(c.column)) ||
+        (timeAsked && /date|time/i.test(c.type));
+      if (nameHit || synonymHit) {
+        score += nameHit ? 1 : 0.5;
+        hitCols.add(`${t.table}.${c.column}`);
+      }
+    }
+    scores.set(t.table, score);
+  }
+
+  const matched = [...scores.entries()].filter(([, s]) => s >= 1);
+  const answers: Record<string, TypeSafeAnswer> = {};
+  answers.answerable = { noul: matched.length ? 0.86 : 0.12 };
+
+  if (matched.length) {
+    // Squared scores keep a clear winner confident as more tables are uploaded.
+    const weight = (s: number) => s * s + 0.05;
+    const total = [...scores.values()].reduce((sum, s) => sum + weight(s), 0);
+    const probabilities = Object.fromEntries(
+      [...scores.entries()].map(([t, s]) => [t, Number((weight(s) / total).toFixed(3))]),
+    );
+    const [choice] = matched.sort((a, b) => b[1] - a[1])[0];
+    answers.table = { choice, confidence: probabilities[choice], probabilities };
+  } else {
+    answers.table = { choice: "uncertain", confidence: 0, probabilities: {} };
+  }
+
+  answers.needs_join = { noul: matched.length >= 2 ? 0.8 : 0.15 };
+  const vague = [...q].some((w) => AMBIGUOUS_WORDS.has(w)) && ![...q].some((w) => METRIC_WORDS.has(w));
+  answers.ambiguous = { noul: vague ? 0.75 : 0.2 };
+
+  for (const cq of buildColumnQuestions(schema, schema.map((t) => t.table))) {
+    const [, table, ...rest] = cq.id.split("__");
+    const column = rest.join("__");
+    answers[cq.id] = {
+      noul: hitCols.has(`${table}.${column}`) ? 0.92 : /(^|_)id$/i.test(column) ? 0.5 : 0.55,
+    };
+  }
+
+  return {
+    answers,
+    model: "mock",
+    usage: { input_tokens: 0 },
+    latency_ms: Math.round(performance.now() - started),
+    input_tokens: 0,
+    cost_usd: 0,
+    mocked: true,
   };
 }

@@ -6,7 +6,7 @@ import { PipelineStrip } from "@/components/PipelineStrip";
 import { ResultArea } from "@/components/ResultArea";
 import { usePipeline } from "@/lib/usePipeline";
 import { PRESETS, type Policy } from "@/lib/types";
-import { History, ListChecks, Scale, SlidersHorizontal } from "lucide-react";
+import { History, ListChecks, SlidersHorizontal } from "lucide-react";
 
 type PresetName = keyof typeof PRESETS;
 
@@ -32,7 +32,7 @@ function App() {
 
   const onPickTable = (t: string) => {
     if (pipeline.clarifyTable) {
-      const lastQ = pipeline.history[0]?.question;
+      const lastQ = pipeline.lastQuestion;
       if (lastQ) pipeline.ask(`${lastQ} (use the ${t} table)`);
     }
   };
@@ -105,7 +105,7 @@ function App() {
             ambiguous={pipeline.ambiguous}
             onRunAnyway={() => {
               // user chose to proceed despite ambiguity; just re-ask
-              const last = pipeline.history[0]?.question;
+              const last = pipeline.lastQuestion;
               if (last) pipeline.ask(last);
             }}
           />
