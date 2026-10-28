@@ -21,3 +21,16 @@ dist-ssr
 *.sln
 *.sw?
 .env
+
+# Local credentials and generated artifacts
+.env.*
+!.env.example
+.creds/
+ArchiveManager-creds.txt
+*.pem
+*.key
+*.p12
+*.pfx
+*.zip
+.cache/
+coverage/
